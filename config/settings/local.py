@@ -25,10 +25,11 @@ if env("ENABLE_SILK", default=False):
 # https://github.com/jazzband/django-silk#profiling
 SILKY_PYTHON_PROFILER = True
 
-# django-extensions
-# ------------------------------------------------------------------------------
-# https://django-extensions.readthedocs.io/en/latest/installation_instructions.html#configuration
-INSTALLED_APPS += ["django_extensions"]
+try:
+    import django_extensions  # noqa: F401
+    INSTALLED_APPS += ["django_extensions"]
+except ImportError:
+    pass
 
 
 # Celery
