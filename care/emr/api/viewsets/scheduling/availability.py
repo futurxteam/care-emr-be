@@ -51,8 +51,9 @@ class SlotsForDayRequestSpec(BaseModel):
 class AppointmentBookingSpec(BaseModel):
     patient: UUID4
     note: str
-
+    appointment_medium: str = "in_person"
     tags: list[UUID4] = []
+
 
 
 class AvailabilityStatsRequestSpec(BaseModel):
@@ -123,7 +124,7 @@ def convert_availability_and_exceptions_to_slots(availabilities, exceptions, day
     return slots
 
 
-def lock_create_appointment(token_slot, patient, created_by, note):
+def lock_create_appointment(token_slot, patient, created_by, note, appointment_medium="in_person"):
     with Lock(f"booking:resource:{token_slot.resource.id}"), transaction.atomic():
         if token_slot.end_datetime < timezone.now():
             raise ValidationError("Slot is already past")
@@ -137,48 +138,42 @@ def lock_create_appointment(token_slot, patient, created_by, note):
             raise ValidationError("Patient already has a booking for this slot")
         token_slot.allocated += 1
         token_slot.save()
-        booking = TokenBooking.objects.create(
-            token_slot=token_slot,
-            patient=patient,
-            booked_by=created_by,
-            created_by=created_by,
-            updated_by=created_by,
-            note=note,
-            status="booked",
-        )
+
         # Generate Charge Item
-        schedule = booking.token_slot.availability.schedule
-        if not schedule.charge_item_definition:
-            return booking
-        last_booking = (
-            TokenBooking.objects.exclude(status__in=CANCELLED_STATUS_CHOICES)
-            .filter(
-                patient=patient,
-                token_slot__availability__schedule=schedule,
-                charge_item__isnull=False,
-                charge_item__status=ChargeItemStatusOptions.paid.value,
-                token_slot__start_datetime__lte=token_slot.start_datetime,
-                charge_item__charge_item_definition=schedule.charge_item_definition,
-            )
-            .order_by("-token_slot__start_datetime")
-        ).first()
-        if last_booking:
-            booking_start_time = last_booking.charge_item.paid_on
-            if not booking_start_time:
-                diff_days = None
+        schedule = token_slot.availability.schedule
+        charge_item_definition = None
+        if schedule.charge_item_definition:
+            last_booking = (
+                TokenBooking.objects.exclude(status__in=CANCELLED_STATUS_CHOICES)
+                .filter(
+                    patient=patient,
+                    token_slot__availability__schedule=schedule,
+                    charge_item__isnull=False,
+                    charge_item__status=ChargeItemStatusOptions.paid.value,
+                    token_slot__start_datetime__lte=token_slot.start_datetime,
+                    charge_item__charge_item_definition=schedule.charge_item_definition,
+                )
+                .order_by("-token_slot__start_datetime")
+            ).first()
+            if last_booking:
+                booking_start_time = last_booking.charge_item.paid_on
+                if not booking_start_time:
+                    diff_days = None
+                else:
+                    new_booking_start_time = token_slot.start_datetime
+                    diff_days = (booking_start_time - new_booking_start_time).days
             else:
-                new_booking_start_time = token_slot.start_datetime
-                diff_days = (booking_start_time - new_booking_start_time).days
-        else:
-            diff_days = None
-        if (
-            schedule.revisit_allowed_days
-            and diff_days is not None
-            and abs(diff_days) <= schedule.revisit_allowed_days
-        ):
-            charge_item_definition = schedule.revisit_charge_item_definition
-        else:
-            charge_item_definition = schedule.charge_item_definition
+                diff_days = None
+            if (
+                schedule.revisit_allowed_days
+                and diff_days is not None
+                and abs(diff_days) <= schedule.revisit_allowed_days
+            ):
+                charge_item_definition = schedule.revisit_charge_item_definition
+            else:
+                charge_item_definition = schedule.charge_item_definition
+
+        charge_item = None
         if charge_item_definition:
             charge_item = apply_charge_item_definition(
                 charge_item_definition,
@@ -186,6 +181,33 @@ def lock_create_appointment(token_slot, patient, created_by, note):
                 token_slot.resource.facility,
                 quantity=1,
             )
+
+        # Determine pricing rules:
+        # - Virtual: Full payment needed
+        # - In-Person: Flat booking token (₹100 INR) if any charge definition exists
+        amount = 0.0
+        if charge_item:
+            if appointment_medium == "virtual":
+                amount = float(charge_item.total_price)
+            else:
+                amount = min(100.0, float(charge_item.total_price))
+
+        payment_required = amount > 0
+        booking_status = "payment_pending" if payment_required else "booked"
+
+        booking = TokenBooking.objects.create(
+            token_slot=token_slot,
+            patient=patient,
+            booked_by=created_by,
+            created_by=created_by,
+            updated_by=created_by,
+            note=note,
+            status=booking_status,
+            appointment_medium=appointment_medium,
+            payment_status="pending" if payment_required else "paid",
+        )
+
+        if charge_item:
             charge_item.service_resource = ChargeItemResourceOptions.appointment.value
             charge_item.service_resource_id = str(booking.external_id)
             charge_item.created_by = created_by
@@ -194,6 +216,37 @@ def lock_create_appointment(token_slot, patient, created_by, note):
             charge_item.save()
             booking.charge_item = charge_item
             booking.save(update_fields=["charge_item"])
+
+        # Call Razorpay to generate order if payment is required
+        if payment_required:
+            import requests
+            from django.conf import settings
+            razorpay_key_id = getattr(settings, "RAZORPAY_KEY_ID", "rzp_test_placeholder")
+            razorpay_key_secret = getattr(settings, "RAZORPAY_KEY_SECRET", "secret_placeholder")
+            amount_paise = int(amount * 100)
+            order_data = {
+                "amount": amount_paise,
+                "currency": "INR",
+                "receipt": f"receipt_booking_{booking.id}",
+            }
+            if "placeholder" not in razorpay_key_id:
+                try:
+                    response = requests.post(
+                        "https://api.razorpay.com/v1/orders",
+                        auth=(razorpay_key_id, razorpay_key_secret),
+                        json=order_data,
+                        timeout=10,
+                    )
+                    if response.status_code == 200:
+                        razorpay_order = response.json()
+                        booking.razorpay_order_id = razorpay_order["id"]
+                        booking.save(update_fields=["razorpay_order_id"])
+                except Exception as e:
+                    print(f"Failed to create Razorpay order: {e}")
+            else:
+                booking.razorpay_order_id = f"order_mock_{booking.id}"
+                booking.save(update_fields=["razorpay_order_id"])
+
         return booking
 
 
@@ -317,7 +370,9 @@ class SlotViewSet(EMRRetrieveMixin, EMRBaseViewSet):
 
             if not patient:
                 raise ValidationError("Patient not found")
-            appointment = lock_create_appointment(obj, patient, user, request_data.note)
+            appointment = lock_create_appointment(
+                obj, patient, user, request_data.note, request_data.appointment_medium
+            )
             if request_data.tags:
                 tag_manager = SingleFacilityTagManager()
                 tag_manager.set_tags(
@@ -342,7 +397,21 @@ class SlotViewSet(EMRRetrieveMixin, EMRBaseViewSet):
         appointment = self.create_appointment_handler(
             slot_obj, request.data, request.user
         )
-        return Response(TokenBookingReadSpec.serialize(appointment).to_json())
+        booking_data = TokenBookingReadSpec.serialize(appointment).to_json()
+        if appointment.status == "payment_pending":
+            booking_data["payment_required"] = True
+            booking_data["razorpay_order_id"] = appointment.razorpay_order_id
+            booking_data["razorpay_key"] = getattr(settings, "RAZORPAY_KEY_ID", "rzp_test_placeholder")
+            amount = 0.0
+            if appointment.charge_item:
+                if appointment.appointment_medium == "virtual":
+                    amount = float(appointment.charge_item.total_price)
+                else:
+                    amount = min(100.0, float(appointment.charge_item.total_price))
+            booking_data["payment_amount"] = int(amount * 100)
+            booking_data["currency"] = "INR"
+        return Response(booking_data)
+
 
     @action(detail=False, methods=["POST"])
     def availability_stats(self, request, *args, **kwargs):

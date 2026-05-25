@@ -77,6 +77,12 @@ class RescheduleBookingSpec(BaseModel):
     tags: list[UUID4] = []
 
 
+class ConfirmPaymentSpec(BaseModel):
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+
 class TokenBookingFilters(FilterSet):
     status = MultiSelectFilter(field_name="status")
     date = DateFromToRangeFilter(field_name="token_slot__start_datetime__date")
@@ -282,6 +288,47 @@ class TokenBookingViewSet(
                 ]
             }
         )
+
+    @extend_schema(
+        request=ConfirmPaymentSpec,
+    )
+    @action(detail=True, methods=["POST"])
+    def confirm_payment(self, request, *args, **kwargs):
+        booking = self.get_object()
+        self.authorize_update({}, booking)
+        request_data = ConfirmPaymentSpec(**request.data)
+
+        if booking.status != BookingStatusChoices.payment_pending.value:
+            raise ValidationError("Booking is not in pending payment state")
+
+        import hmac
+        import hashlib
+        from django.conf import settings
+
+        key_secret = getattr(settings, "RAZORPAY_KEY_SECRET", "secret_placeholder")
+        message = f"{booking.razorpay_order_id}|{request_data.razorpay_payment_id}".encode("utf-8")
+        expected_signature = hmac.new(
+            key_secret.encode("utf-8"),
+            message,
+            hashlib.sha256
+        ).hexdigest()
+
+        if expected_signature != request_data.razorpay_signature and "placeholder" not in key_secret:
+            raise ValidationError("Invalid payment signature")
+
+        with transaction.atomic():
+            booking.status = BookingStatusChoices.booked.value
+            booking.payment_status = "paid"
+            booking.razorpay_payment_id = request_data.razorpay_payment_id
+
+            if booking.charge_item:
+                booking.charge_item.status = ChargeItemStatusOptions.paid.value
+                booking.charge_item.paid_on = timezone.now()
+                booking.charge_item.save(update_fields=["status", "paid_on"])
+
+            booking.save(update_fields=["status", "payment_status", "razorpay_payment_id"])
+
+        return Response(TokenBookingReadSpec.serialize(booking).to_json())
 
     @extend_schema(
         request=TokenGenerationSpec,

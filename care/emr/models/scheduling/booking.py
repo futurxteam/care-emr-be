@@ -48,3 +48,16 @@ class TokenBooking(EMRBaseModel):
     charge_item = models.ForeignKey(
         "emr.ChargeItem", on_delete=models.CASCADE, null=True, blank=True
     )
+    appointment_medium = models.CharField(
+        max_length=50,
+        choices=[("virtual", "Virtual"), ("in_person", "In Person")],
+        default="in_person",
+    )
+    payment_status = models.CharField(
+        max_length=50,
+        choices=[("pending", "Pending"), ("paid", "Paid"), ("failed", "Failed")],
+        default="pending",
+    )
+    razorpay_order_id = models.CharField(max_length=255, null=True, blank=True)
+    razorpay_payment_id = models.CharField(max_length=255, null=True, blank=True)
+

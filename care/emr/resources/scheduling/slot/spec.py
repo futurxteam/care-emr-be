@@ -45,6 +45,7 @@ class TokenSlotBaseSpec(EMRResource):
 class BookingStatusChoices(str, Enum):
     proposed = "proposed"
     pending = "pending"
+    payment_pending = "payment_pending"
     booked = "booked"
     arrived = "arrived"
     fulfilled = "fulfilled"
@@ -120,6 +121,9 @@ class TokenBookingBaseReadSpec(TokenBookingBaseSpec):
     token: TokenReadSpec | None = None
     tags: list[dict] = []
     charge_item: dict | None = None
+    appointment_medium: str | None = None
+    payment_status: str | None = None
+    razorpay_order_id: str | None = None
 
     @classmethod
     def perform_extra_serialization(cls, mapping, obj):
