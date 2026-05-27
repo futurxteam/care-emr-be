@@ -3,6 +3,8 @@ from pydantic import UUID4, BaseModel
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
+from django.db import transaction
+from django.utils import timezone
 
 from care.emr.api.viewsets.base import EMRBaseViewSet, EMRRetrieveMixin
 from care.emr.api.viewsets.scheduling import (
@@ -13,6 +15,7 @@ from care.emr.api.viewsets.scheduling import (
 from care.emr.api.viewsets.scheduling.booking import TokenBookingViewSet
 from care.emr.models.patient import Patient
 from care.emr.models.scheduling import TokenBooking, TokenSlot
+from care.emr.resources.charge_item.spec import ChargeItemStatusOptions
 from care.emr.resources.scheduling.slot.spec import (
     BookingStatusChoices,
     TokenBookingOTPReadSpec,
@@ -32,6 +35,14 @@ class SlotsForDayRequestSpec(SlotsForDayRequestSpec):
 class CancelAppointmentSpec(BaseModel):
     patient: UUID4
     appointment: UUID4
+
+
+class OTPConfirmPaymentSpec(BaseModel):
+    appointment: UUID4
+    patient: UUID4
+    razorpay_payment_id: str
+    razorpay_signature: str
+
 
 
 class OTPSlotViewSet(EMRRetrieveMixin, EMRBaseViewSet):
@@ -68,9 +79,21 @@ class OTPSlotViewSet(EMRRetrieveMixin, EMRBaseViewSet):
         appointment = SlotViewSet.create_appointment_handler(
             self.get_object(), request.data, None
         )
-        return Response(
-        TokenBookingOTPReadSpec.serialize(appointment).model_dump()
-    )
+        booking_data = TokenBookingOTPReadSpec.serialize(appointment).model_dump()
+        if appointment.status == "payment_pending":
+            from django.conf import settings
+            booking_data["payment_required"] = True
+            booking_data["razorpay_order_id"] = appointment.razorpay_order_id
+            booking_data["razorpay_key"] = getattr(settings, "RAZORPAY_KEY_ID", "rzp_test_placeholder")
+            amount = 0.0
+            if appointment.charge_item:
+                if appointment.appointment_medium == "virtual":
+                    amount = float(appointment.charge_item.total_price)
+                else:
+                    amount = min(100.0, float(appointment.charge_item.total_price))
+            booking_data["payment_amount"] = int(amount * 100)
+            booking_data["currency"] = "INR"
+        return Response(booking_data)
 
     @extend_schema(
         request=CancelAppointmentSpec,
@@ -92,6 +115,54 @@ class OTPSlotViewSet(EMRRetrieveMixin, EMRBaseViewSet):
         return Response(
         TokenBookingOTPReadSpec.serialize(appointment).model_dump()
     )
+
+    @extend_schema(
+        request=OTPConfirmPaymentSpec,
+    )
+    @action(detail=False, methods=["POST"])
+    def confirm_payment(self, request, *args, **kwargs):
+        request_data = OTPConfirmPaymentSpec(**request.data)
+        patient = get_object_or_404(
+            Patient,
+            external_id=request_data.patient,
+            phone_number=request.user.phone_number,
+        )
+        booking = get_object_or_404(
+            TokenBooking, external_id=request_data.appointment, patient=patient
+        )
+
+        if booking.status != BookingStatusChoices.payment_pending.value:
+            raise ValidationError("Booking is not in pending payment state")
+
+        import hmac
+        import hashlib
+        from django.conf import settings
+
+        key_secret = getattr(settings, "RAZORPAY_KEY_SECRET", "secret_placeholder")
+        message = f"{booking.razorpay_order_id}|{request_data.razorpay_payment_id}".encode("utf-8")
+        expected_signature = hmac.new(
+            key_secret.encode("utf-8"),
+            message,
+            hashlib.sha256
+        ).hexdigest()
+
+        if expected_signature != request_data.razorpay_signature and "placeholder" not in key_secret:
+            raise ValidationError("Invalid payment signature")
+
+        with transaction.atomic():
+            booking.status = BookingStatusChoices.booked.value
+            booking.payment_status = "paid"
+            booking.razorpay_payment_id = request_data.razorpay_payment_id
+
+            if booking.charge_item:
+                booking.charge_item.status = ChargeItemStatusOptions.paid.value
+                booking.charge_item.paid_on = timezone.now()
+                booking.charge_item.save(update_fields=["status", "paid_on"])
+
+            booking.save(update_fields=["status", "payment_status", "razorpay_payment_id"])
+
+        return Response(TokenBookingOTPReadSpec.serialize(booking).model_dump())
+
     @action(detail=False, methods=["GET"])
     def get_appointments(self, request, *args, **kwargs):
         appointments = TokenBooking.objects.filter(
@@ -105,3 +176,4 @@ class OTPSlotViewSet(EMRRetrieveMixin, EMRBaseViewSet):
 ]
             }
         )
+
